@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
   # 定时检查，每小时一次
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 0 * * *'  # 每天零点 UTC
   # 接收来自上游仓库的 webhook 触发
   repository_dispatch:
     types:
