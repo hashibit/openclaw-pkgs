@@ -172,14 +172,14 @@ jobs:
         shell: bash
         run: |
           FINAL_FILE="${{ steps.package.outputs.final_file }}"
-          # 使用 sha256sum 或 shasum（跨平台）
+          # 生成标准格式 checksum (hash filename)
           if command -v sha256sum &> /dev/null; then
-            sha256sum "$FINAL_FILE" | cut -d' ' -f1 > "$FINAL_FILE.sha256"
+            sha256sum "$FINAL_FILE" > "$FINAL_FILE.sha256"
           elif command -v shasum &> /dev/null; then
-            shasum -a 256 "$FINAL_FILE" | cut -d' ' -f1 > "$FINAL_FILE.sha256"
+            shasum -a 256 "$FINAL_FILE" > "$FINAL_FILE.sha256"
           else
             # Node.js fallback
-            node -e "const crypto=require('crypto');const fs=require('fs');const h=crypto.createHash('sha256').update(fs.readFileSync('$FINAL_FILE')).digest('hex');fs.writeFileSync('$FINAL_FILE.sha256',h)"
+            node -e "const crypto=require('crypto');const fs=require('fs');const h=crypto.createHash('sha256').update(fs.readFileSync('$FINAL_FILE')).digest('hex');fs.writeFileSync('$FINAL_FILE.sha256',h + '  ' + '$FINAL_FILE')"
           fi
           echo "SHA256 checksum generated"
 
