@@ -193,8 +193,10 @@ jobs:
           retention-days: 1
 
   release:
-    needs: build
+    needs: [build, check-version]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download all artifacts
@@ -263,6 +265,8 @@ jobs:
     needs: release
     if: always() && needs.release.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Delete old releases
