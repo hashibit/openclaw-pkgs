@@ -1,0 +1,279 @@
+name: Build and Release Packages
+
+on:
+  # 手动触发
+  workflow_dispatch:
+  # 定时检查，每小时一次
+  schedule:
+    - cron: '0 * * * *'
+  # 接收来自上游仓库的 webhook 触发
+  repository_dispatch:
+    types:
+      - openclaw-release
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      new_version: ${{ steps.check.outputs.new_version }}
+
+    steps:
+      - name: Check for new release
+        id: check
+        run: |
+          # 获取上游最新版本
+          LATEST_VERSION=$(curl -s https://registry.npmjs.org/openclaw/latest | jq -r '.version')
+          echo "Latest version: $LATEST_VERSION"
+
+          # 获取当前仓库的最新 release 版本
+          CURRENT_VERSION=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" 2>/dev/null | jq -r '.tag_name // "v0.0.0"' | sed 's/^v//')
+          echo "Current version: $CURRENT_VERSION"
+
+          # 比较版本
+          if [ "$LATEST_VERSION" != "$CURRENT_VERSION" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "new_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+            echo "New version detected: $LATEST_VERSION"
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "No new version"
+          fi
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    strategy:
+      matrix:
+        include:
+          # Windows
+          - os: windows-latest
+            platform: windows
+            arch: x64
+            node_arch: win-x64
+            ext: zip
+          - os: windows-latest
+            platform: windows
+            arch: arm64
+            node_arch: win-arm64
+            ext: zip
+          # macOS
+          - os: macos-latest
+            platform: darwin
+            arch: x64
+            node_arch: darwin-x64
+            ext: tar.gz
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+            node_arch: darwin-arm64
+            ext: tar.gz
+          # Linux
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            node_arch: linux-x64
+            ext: tar.gz
+          - os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            node_arch: linux-arm64
+            ext: tar.gz
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download Node.js binaries
+        shell: bash
+        run: |
+          # 获取 Node.js 22.x 最新版本
+          VERSIONS=$(curl -s https://nodejs.org/dist/index.json)
+          LATEST22=$(echo "$VERSIONS" | jq -r 'first | .version')
+          echo "Downloading Node.js $LATEST22 for ${{ matrix.node_arch }}..."
+
+          # 下载对应平台的 Node.js
+          URL="https://nodejs.org/dist/${LATEST22}/node-${LATEST22}-${{ matrix.node_arch }}.${{ matrix.ext }}"
+          curl -L -o "nodejs-archive" "$URL"
+
+          # 解压并重命名为 nodejs
+          mkdir -p nodejs
+          if [[ "${{ matrix.ext }}" == "zip" ]]; then
+            unzip -q nodejs-archive
+            mv node-${LATEST22}-${{ matrix.node_arch }} nodejs
+          else
+            tar -xzf nodejs-archive --strip-components=1 -C nodejs
+          fi
+
+          echo "Node.js $LATEST22 downloaded for ${{ matrix.node_arch }}"
+
+      - name: Install OpenClaw
+        shell: bash
+        env:
+          VERSION: ${{ needs.check-version.outputs.new_version }}
+        run: |
+          # 更新 package.json 中的版本
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            # Windows PowerShell
+            $packageJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
+            $packageJson.dependencies.openclaw = "^$env:VERSION"
+            $packageJson | ConvertTo-Json -Depth 10 | Set-Content -Path "package.json"
+          else
+            # Unix
+            jq --arg ver "^$VERSION" '.dependencies.openclaw = $ver' package.json > package.json.tmp
+            mv package.json.tmp package.json
+          fi
+
+          echo "Installing OpenClaw version: $VERSION"
+          npm install --legacy-peer-deps
+          echo "OpenClaw $VERSION installed"
+
+      - name: Create offline package
+        shell: bash
+        env:
+          VERSION: ${{ needs.check-version.outputs.new_version }}
+        run: |
+          # 创建临时打包目录
+          mkdir -p package-temp
+
+          # 复制必要文件
+          cp -r nodejs package-temp/
+          cp -r node_modules package-temp/
+          cp package.json package-temp/
+          cp package-lock.json package-temp/
+          cp README.md package-temp/
+
+          # 设置输出文件名
+          ARCH_NAME="${{ matrix.platform }}-${{ matrix.arch }}"
+          PACKAGE_NAME="openclaw-pkgs-v${VERSION}-${ARCH_NAME}"
+
+          # 创建压缩包
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            # Windows 使用 PowerShell 创建 ZIP
+            powershell -Command "Compress-Archive -Path package-temp -DestinationPath ${PACKAGE_NAME}.zip -Force"
+            FINAL_FILE="${PACKAGE_NAME}.zip"
+          else
+            # macOS/Linux 使用 tar.gz
+            tar -czf "${PACKAGE_NAME}.tar.gz" -C package-temp .
+            FINAL_FILE="${PACKAGE_NAME}.tar.gz"
+          fi
+
+          echo "Package created: ${FINAL_FILE}"
+
+          # 获取文件大小
+          FILE_SIZE=$(du -h "${FINAL_FILE}" | cut -f1)
+          echo "Package size: ${FILE_SIZE}"
+
+          # 保存文件名供后续步骤使用
+          echo "FINAL_FILE=${FINAL_FILE}" >> $GITHUB_ENV
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            # Windows PowerShell
+            powershell -Command "\$hash = Get-FileHash -Path '${{ env.FINAL_FILE }}' -Algorithm SHA256; \$hash.Hash | Out-File -FilePath '${{ env.FINAL_FILE }}.sha256' -NoNewline"
+          else
+            # Unix
+            sha256sum "${{ env.FINAL_FILE }}" | cut -d' ' -f1 > "${{ env.FINAL_FILE }}.sha256"
+          fi
+          echo "SHA256 checksum generated"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            ${{ env.FINAL_FILE }}
+            ${{ env.FINAL_FILE }}.sha256
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          ls -la artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.new_version }}
+          name: OpenClaw v${{ needs.check-version.outputs.new_version }} Packages
+          body: |
+            ## OpenClaw v${{ needs.check-version.outputs.new_version }} Packages
+
+            ### 下载地址
+
+            | 平台 | 架构 | 文件 |
+            |------|------|------|
+            | Windows | x64 (amd64) | `openclaw-pkgs-v${{ needs.check-version.outputs.new_version }}-windows-x64.zip` |
+            | Windows | arm64 | `openclaw-pkgs-v${{ needs.check-version.outputs.new_version }}-windows-arm64.zip` |
+            | macOS | x64 (amd64) | `openclaw-pkgs-v${{ needs.check-version.outputs.new_version }}-darwin-x64.tar.gz` |
+            | macOS | arm64 (M1/M2) | `openclaw-pkgs-v${{ needs.check-version.outputs.new_version }}-darwin-arm64.tar.gz` |
+            | Linux | x64 (amd64) | `openclaw-pkgs-v${{ needs.check-version.outputs.new_version }}-linux-x64.tar.gz` |
+            | Linux | arm64 | `openclaw-pkgs-v${{ needs.check-version.outputs.new_version }}-linux-arm64.tar.gz` |
+
+            ### 包含内容
+            - Node.js 22.x 运行时 (对应平台和架构)
+            - OpenClaw v${{ needs.check-version.outputs.new_version }} 及所有依赖
+
+            ### 使用方法
+            1. 下载对应平台的离线包
+            2. 解压到任意目录
+            3. 使用内置的 Node.js 运行 OpenClaw:
+               ```bash
+               # macOS/Linux
+               ./nodejs/bin/node ./node_modules/.bin/openclaw
+
+               # Windows
+               nodejs\node.exe node_modules\.bin\openclaw
+               ```
+
+            ### 系统要求
+            - 无需预装 Node.js
+            - 选择与您的系统架构匹配的版本
+
+            ---
+            上游仓库: https://github.com/openclaw/openclaw/releases/tag/v${{ needs.check-version.outputs.new_version }}
+          files: artifacts/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release completed
+        run: |
+          echo "Release v${{ needs.check-version.outputs.new_version }} created successfully!"
+
+  # 清理旧的 release，只保留最近 5 个
+  cleanup:
+    needs: release
+    if: always() && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete old releases
+        uses: dev-drprasad/delete-older-releases@v0.3.2
+        with:
+          keep_latest: 5
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
