@@ -139,28 +139,18 @@ jobs:
         env:
           VERSION: ${{ needs.check-version.outputs.new_version }}
         run: |
-          # 创建临时打包目录
-          mkdir -p package-temp
-
-          # 复制必要文件
-          cp -r nodejs package-temp/
-          cp -r node_modules package-temp/
-          cp package.json package-temp/
-          cp package-lock.json package-temp/
-          cp README.md package-temp/
-
           # 设置输出文件名
           ARCH_NAME="${{ matrix.platform }}-${{ matrix.arch }}"
           PACKAGE_NAME="openclaw-pkgs-v${VERSION}-${ARCH_NAME}"
 
-          # 创建压缩包
+          # 创建压缩包（直接打包，不复制文件）
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            # Windows 使用 PowerShell 创建 ZIP
-            powershell -Command "Compress-Archive -Path package-temp -DestinationPath ${PACKAGE_NAME}.zip -Force"
+            # Windows 使用 7zip（比 PowerShell Compress-Archive 快得多）
+            7z a -tzip "${PACKAGE_NAME}.zip" nodejs node_modules package.json package-lock.json README.md
             FINAL_FILE="${PACKAGE_NAME}.zip"
           else
             # macOS/Linux 使用 tar.gz
-            tar -czf "${PACKAGE_NAME}.tar.gz" -C package-temp .
+            tar -czf "${PACKAGE_NAME}.tar.gz" nodejs node_modules package.json package-lock.json README.md
             FINAL_FILE="${PACKAGE_NAME}.tar.gz"
           fi
 
@@ -172,17 +162,24 @@ jobs:
 
           # 保存文件名供后续步骤使用
           echo "final_file=${FINAL_FILE}" >> $GITHUB_OUTPUT
+          FILE_SIZE=$(du -h "${FINAL_FILE}" | cut -f1)
+          echo "Package size: ${FILE_SIZE}"
+
+          # 保存文件名供后续步骤使用
+          echo "final_file=${FINAL_FILE}" >> $GITHUB_OUTPUT
 
       - name: Generate checksum
         shell: bash
         run: |
           FINAL_FILE="${{ steps.package.outputs.final_file }}"
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            # Windows PowerShell
-            powershell -Command "\$hash = Get-FileHash -Path '$FINAL_FILE' -Algorithm SHA256; \$hash.Hash | Out-File -FilePath '$FINAL_FILE.sha256' -NoNewline"
-          else
-            # Unix
+          # 使用 sha256sum 或 shasum（跨平台）
+          if command -v sha256sum &> /dev/null; then
             sha256sum "$FINAL_FILE" | cut -d' ' -f1 > "$FINAL_FILE.sha256"
+          elif command -v shasum &> /dev/null; then
+            shasum -a 256 "$FINAL_FILE" | cut -d' ' -f1 > "$FINAL_FILE.sha256"
+          else
+            # Node.js fallback
+            node -e "const crypto=require('crypto');const fs=require('fs');const h=crypto.createHash('sha256').update(fs.readFileSync('$FINAL_FILE')).digest('hex');fs.writeFileSync('$FINAL_FILE.sha256',h)"
           fi
           echo "SHA256 checksum generated"
 
